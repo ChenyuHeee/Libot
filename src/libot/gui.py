@@ -35,6 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     _require_pyside6()
 
     from PySide6.QtCore import QDate, Qt, QTimer
+    from PySide6.QtGui import QAction
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -45,22 +46,68 @@ def main(argv: list[str] | None = None) -> int:
         QListWidget,
         QListWidgetItem,
         QMainWindow,
+        QMenu,
         QMessageBox,
         QPushButton,
+        QStyle,
         QSpinBox,
         QSplitter,
+        QSystemTrayIcon,
         QTreeWidget,
         QTreeWidgetItem,
         QVBoxLayout,
         QWidget,
     )
 
+    def _macos_hide_dock_icon_best_effort() -> None:
+        if sys.platform != "darwin":
+            return
+        try:
+            import ctypes
+
+            objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
+            objc.objc_getClass.restype = ctypes.c_void_p
+            objc.sel_registerName.restype = ctypes.c_void_p
+            objc.objc_msgSend.restype = ctypes.c_void_p
+
+            def cls(name: str) -> ctypes.c_void_p:
+                return ctypes.c_void_p(objc.objc_getClass(name.encode("utf-8")))
+
+            def sel(name: str) -> ctypes.c_void_p:
+                return ctypes.c_void_p(objc.sel_registerName(name.encode("utf-8")))
+
+            objc_msgSend = objc.objc_msgSend
+            objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+            NSApplication = cls("NSApplication")
+            shared = objc_msgSend(NSApplication, sel("sharedApplication"))
+
+            # NSApplicationActivationPolicyProhibited = 2
+            objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+            objc.objc_msgSend(ctypes.c_void_p(shared), sel("setActivationPolicy:"), 2)
+        except Exception:
+            # 失败也不影响功能；打包 .app 会用 Info.plist 保证隐藏 Dock 图标
+            return
+
     config = load_config()
     client = LibotClient(config=config)
 
     app = QApplication(argv or [])
+    app.setQuitOnLastWindowClosed(False)
 
-    window = QMainWindow()
+    _macos_hide_dock_icon_best_effort()
+
+    is_quitting = {"flag": False}
+
+    class MainWindow(QMainWindow):
+        def closeEvent(self, event) -> None:  # type: ignore[override]
+            # 点击左上角关闭：仅隐藏，不退出
+            if is_quitting["flag"]:
+                return super().closeEvent(event)
+            event.ignore()
+            self.hide()
+
+    window = MainWindow()
     window.setWindowTitle("Libot")
 
     root = QWidget()
@@ -459,5 +506,39 @@ def main(argv: list[str] | None = None) -> int:
 
     window.resize(1200, 800)
     window.show()
+
+    # 菜单栏图标（macOS 会显示在 menu bar；其他系统显示在托盘）
+    tray_icon = QSystemTrayIcon()
+    icon = app.windowIcon()
+    if icon.isNull():
+        icon = app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+    tray_icon.setIcon(icon)
+    tray_icon.setToolTip("Libot")
+
+    tray_menu = QMenu()
+    action_show = QAction("显示/隐藏")
+    action_quit = QAction("退出")
+    tray_menu.addAction(action_show)
+    tray_menu.addSeparator()
+    tray_menu.addAction(action_quit)
+    tray_icon.setContextMenu(tray_menu)
+
+    def toggle_window() -> None:
+        if window.isVisible():
+            window.hide()
+        else:
+            window.show()
+            window.raise_()
+            window.activateWindow()
+
+    def quit_app() -> None:
+        is_quitting["flag"] = True
+        tray_icon.hide()
+        app.quit()
+
+    action_show.triggered.connect(toggle_window)
+    action_quit.triggered.connect(quit_app)
+    tray_icon.activated.connect(lambda _reason: toggle_window())
+    tray_icon.show()
 
     return app.exec()

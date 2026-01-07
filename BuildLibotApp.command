@@ -49,4 +49,12 @@ fi
   app_gui.py
 
 echo "[Libot] 打包完成：dist/Libot.app"
+
+INFO_PLIST="dist/Libot.app/Contents/Info.plist"
+if [[ -f "$INFO_PLIST" ]]; then
+  echo "[Libot] 设置为菜单栏应用（隐藏 Dock 图标）：LSUIElement=1"
+  /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$INFO_PLIST" >/dev/null 2>&1 || \
+  /usr/libexec/PlistBuddy -c "Set :LSUIElement true" "$INFO_PLIST" >/dev/null 2>&1 || true
+fi
+
 echo "[Libot] 你可以在 Finder 里打开 dist/Libot.app"
