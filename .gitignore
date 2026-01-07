@@ -30,3 +30,6 @@ config.json
 
 # Bundled defaults may contain secrets; keep local version untracked
 libot_bundled.json
+
+# Release artifacts (built locally)
+Libot-v*.zip
