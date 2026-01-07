@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "libot"
+version = "0.1.0"
+description = "Wrapper client for ZJU Library seat booking (booking.lib.zju.edu.cn)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Libot contributors" }]
+keywords = ["zju", "library", "booking"]
+dependencies = [
+  "requests>=2.31",
+]
+
+[project.optional-dependencies]
+gui = [
+  "PySide6>=6.6",
+]
+
+[project.scripts]
+libot = "libot.cli:main"
+libot-gui = "libot.gui:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

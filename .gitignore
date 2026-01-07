@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.spec
+.venv/
+venv/
+.env
+.env.*
+.python-version
+.DS_Store
+.AppleDouble
+.LSOverride
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Local secrets / overrides (optional)
+config.json
+*secrets*
+
+# Bundled defaults may contain secrets; keep local version untracked
+libot_bundled.json
