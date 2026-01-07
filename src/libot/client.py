@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .config import LibotConfig
 
@@ -52,6 +54,26 @@ class LibotClient:
     def __init__(self, config: LibotConfig | None = None, session: requests.Session | None = None):
         self.config = config or LibotConfig()
         self.session = session or requests.Session()
+
+        # Avoid indefinite hangs: set retry/backoff for transient network errors.
+        # Note: timeouts are applied per request in get()/post().
+        try:
+            retry = Retry(
+                total=3,
+                connect=3,
+                read=3,
+                backoff_factor=0.5,
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods=("GET", "POST"),
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry)
+            self.session.mount("https://", adapter)
+            self.session.mount("http://", adapter)
+        except Exception:
+            # Best-effort: requests/urllib3 versions may vary.
+            pass
+
         if self.config.cookie:
             self.set_cookie_header(self.config.cookie)
 
@@ -68,12 +90,17 @@ class LibotClient:
 
     def get(self, path: str, **kwargs: Any) -> requests.Response:
         url = self.base_url + (path if path.startswith("/") else f"/{path}")
+        if "timeout" not in kwargs:
+            # (connect timeout, read timeout)
+            kwargs["timeout"] = (6, 20)
         resp = self.session.get(url, **kwargs)
         resp.raise_for_status()
         return resp
 
     def post(self, path: str, **kwargs: Any) -> requests.Response:
         url = self.base_url + (path if path.startswith("/") else f"/{path}")
+        if "timeout" not in kwargs:
+            kwargs["timeout"] = (6, 20)
         resp = self.session.post(url, **kwargs)
         resp.raise_for_status()
         return resp

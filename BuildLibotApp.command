@@ -55,6 +55,10 @@ if [[ -f "$INFO_PLIST" ]]; then
   echo "[Libot] 设置为菜单栏应用（隐藏 Dock 图标）：LSUIElement=1"
   /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$INFO_PLIST" >/dev/null 2>&1 || \
   /usr/libexec/PlistBuddy -c "Set :LSUIElement true" "$INFO_PLIST" >/dev/null 2>&1 || true
+
+  echo "[Libot] 尝试禁用 App Nap：NSAppSleepDisabled=1"
+  /usr/libexec/PlistBuddy -c "Add :NSAppSleepDisabled bool true" "$INFO_PLIST" >/dev/null 2>&1 || \
+  /usr/libexec/PlistBuddy -c "Set :NSAppSleepDisabled true" "$INFO_PLIST" >/dev/null 2>&1 || true
 fi
 
 echo "[Libot] 你可以在 Finder 里打开 dist/Libot.app"

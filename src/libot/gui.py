@@ -34,7 +34,16 @@ def main(argv: list[str] | None = None) -> int:
     # 延迟导入，避免没装 GUI 依赖时影响 CLI。
     _require_pyside6()
 
-    from PySide6.QtCore import QDate, Qt, QTimer
+    from PySide6.QtCore import (
+        QDate,
+        QObject,
+        QRunnable,
+        Qt,
+        QThreadPool,
+        QTimer,
+        Signal,
+        Slot,
+    )
     from PySide6.QtGui import QAction
     from PySide6.QtWidgets import (
         QApplication,
@@ -109,6 +118,9 @@ def main(argv: list[str] | None = None) -> int:
 
     window = MainWindow()
     window.setWindowTitle("Libot")
+
+    # Keep strong refs to background workers to avoid GC-related Qt segfaults.
+    active_workers: set[object] = set()
 
     root = QWidget()
     window.setCentralWidget(root)
@@ -263,6 +275,132 @@ def main(argv: list[str] | None = None) -> int:
     # 保留状态字典（未来如需去重/节流可用）
     last_has_free: dict[str, bool] = {}
 
+    @dataclass(frozen=True)
+    class RefreshResult:
+        q: Query
+        grouped: dict[str, list[tuple[str, str]]]
+        total_rooms: int
+        total_free: int
+        lib_free_map: dict[str, int]
+        seat_nos_map: dict[str, list[str]]
+        dingtalk_ok: bool | None
+        dingtalk_status: str | None
+
+    class _WorkerSignals(QObject):
+        ok = Signal(object)
+        error = Signal(str)
+        finished = Signal()
+
+    class _RefreshWorker(QRunnable):
+        def __init__(
+            self,
+            *,
+            cookie: str | None,
+            q: Query,
+            per_room_limit: int,
+            webhook: str,
+            monitor_all: bool,
+            selected_libs: list[str],
+        ) -> None:
+            super().__init__()
+            self.signals = _WorkerSignals()
+            self.cookie = cookie
+            self.q = q
+            self.per_room_limit = per_room_limit
+            self.webhook = webhook
+            self.monitor_all = monitor_all
+            self.selected_libs = selected_libs
+
+        @Slot()
+        def run(self) -> None:  # type: ignore[override]
+            try:
+                if self.cookie:
+                    client.set_cookie_header(self.cookie)
+
+                grouped = load_room_index()
+
+                effective_libs = list(grouped.keys()) if self.monitor_all else self.selected_libs
+
+                total_rooms = 0
+                total_free = 0
+                lib_free_map: dict[str, int] = {}
+                seat_nos_map: dict[str, list[str]] = {}
+
+                for lib_name, rooms in grouped.items():
+                    lib_free = 0
+                    for room_id, _room_name in rooms:
+                        total_rooms += 1
+                        seats = client.list_free_seats(
+                            area=room_id,
+                            day=self.q.day,
+                            segment=self.q.segment,
+                            start_time=self.q.start_time,
+                            end_time=self.q.end_time,
+                        )
+                        lib_free += len(seats)
+                        total_free += len(seats)
+                        seat_nos = [s.no for s in seats if s.no]
+                        seat_nos_map[room_id] = seat_nos
+
+                    lib_free_map[lib_name] = lib_free
+
+                # --- 钉钉推送逻辑 ---
+                dingtalk_ok: bool | None = None
+                dingtalk_status: str | None = None
+
+                has_free = False
+                if effective_libs:
+                    has_free = any(lib_free_map.get(lib, 0) > 0 for lib in effective_libs)
+
+                should_send = bool(self.webhook) and bool(effective_libs) and has_free
+                last_has_free[_monitor_key(effective_libs)] = has_free
+
+                if should_send:
+                    chunks: list[str] = []
+                    for lib in effective_libs:
+                        if lib_free_map.get(lib, 0) <= 0:
+                            continue
+
+                        room_lines: list[str] = []
+                        for room_id, room_name in grouped.get(lib, []):
+                            if not seat_nos_map.get(room_id):
+                                continue
+                            link = (
+                                f"{client.base_url}/h5/index.html#/SeatScreening/{self.q.segment}"
+                                f"/roomDetail?detail={room_id}&date={self.q.day}"
+                            )
+                            room_title = room_name or room_id
+                            room_lines.append(f"【{room_title}】{link}")
+
+                        header = f"{lib}有空位："
+                        if room_lines:
+                            chunks.append(header + "\n" + "\n".join(room_lines))
+                        else:
+                            chunks.append(header)
+
+                    text = "\n\n".join(chunks) if chunks else "当前无空位"
+                    dingtalk_ok = send_dingtalk(self.webhook, text)
+                    dingtalk_status = "已推送通知到钉钉" if dingtalk_ok else "推送钉钉失败"
+
+                self.signals.ok.emit(
+                    RefreshResult(
+                        q=self.q,
+                        grouped=grouped,
+                        total_rooms=total_rooms,
+                        total_free=total_free,
+                        lib_free_map=lib_free_map,
+                        seat_nos_map=seat_nos_map,
+                        dingtalk_ok=dingtalk_ok,
+                        dingtalk_status=dingtalk_status,
+                    )
+                )
+            except LibotError as e:
+                self.signals.error.emit(str(e))
+            except Exception as e:  # pragma: no cover
+                self.signals.error.emit(repr(e))
+            finally:
+                self.signals.finished.emit()
+
     caffeinate_proc: subprocess.Popen[str] | None = None
 
     def set_keep_awake(enabled: bool) -> None:
@@ -319,46 +457,68 @@ def main(argv: list[str] | None = None) -> int:
         return selected
 
     def refresh() -> None:
-        ensure_cookie()
+        refresh_state = getattr(refresh, "_state", None)
+        if refresh_state is None:
+            refresh_state = {"in_flight": False}
+            setattr(refresh, "_state", refresh_state)
 
+        if refresh_state["in_flight"]:
+            return
+
+        cookie = cookie_input.text().strip() or os.environ.get("LIBOT_COOKIE") or config.cookie
         q = Query(
             day=day_edit.date().toString("yyyy-MM-dd"),
             segment=segment_input.text().strip() or "1",
             start_time=start_input.text().strip() or "08:00",
             end_time=end_input.text().strip() or "22:00",
         )
+        per_room_limit = int(limit_spin.value())
 
-        try:
-            grouped = load_room_index()
-            per_room_limit = int(limit_spin.value())
+        # webhook 和监控馆舍选择在主线程读取，避免 worker 线程读取 Qt 对象。
+        webhook = (
+            webhook_input.text().strip()
+            or os.environ.get("DINGTALK_WEBHOOK")
+            or get_bundled_dingtalk_webhook()
+            or ""
+        )
 
+        # 仅从勾选状态读取选择，不触发任何网络请求。
+        monitor_all = False
+        selected_libs: list[str] = []
+        for i in range(monitor_list.count()):
+            it = monitor_list.item(i)
+            lib = it.data(Qt.ItemDataRole.UserRole)
+            if lib == "__all__":
+                monitor_all = it.checkState() == Qt.CheckState.Checked
+                continue
+            if it.checkState() == Qt.CheckState.Checked and isinstance(lib, str):
+                selected_libs.append(lib)
+
+        refresh_state["in_flight"] = True
+        reload_btn.setEnabled(False)
+        status_label.setText(status_label.text() + "\n刷新中…")
+
+        worker = _RefreshWorker(
+            cookie=cookie,
+            q=q,
+            per_room_limit=per_room_limit,
+            webhook=webhook,
+            monitor_all=monitor_all,
+            selected_libs=selected_libs,
+        )
+        active_workers.add(worker)
+
+        def apply_result(res: RefreshResult) -> None:
             tree_widget.clear()
 
-            total_rooms = 0
-            total_free = 0
-
-            lib_free_map: dict[str, int] = {}
-            seat_nos_map: dict[str, list[str]] = {}
-
-            for lib_name, rooms in grouped.items():
-                lib_item = QTreeWidgetItem([lib_name, "", ""])
+            for lib_name, rooms in res.grouped.items():
+                lib_item = QTreeWidgetItem([lib_name, str(res.lib_free_map.get(lib_name, 0)), ""])
                 lib_item.setFirstColumnSpanned(False)
                 tree_widget.addTopLevelItem(lib_item)
+                lib_item.setExpanded(False)
 
-                lib_free = 0
                 for room_id, room_name in rooms:
-                    total_rooms += 1
-                    seats = client.list_free_seats(
-                        area=room_id,
-                        day=q.day,
-                        segment=q.segment,
-                        start_time=q.start_time,
-                        end_time=q.end_time,
-                    )
-                    lib_free += len(seats)
-                    total_free += len(seats)
-
-                    seat_nos = [s.no for s in seats if s.no]
+                    seat_nos = res.seat_nos_map.get(room_id, [])
                     if per_room_limit > 0:
                         shown = seat_nos[:per_room_limit]
                         more = len(seat_nos) - len(shown)
@@ -371,81 +531,36 @@ def main(argv: list[str] | None = None) -> int:
                         seat_text += f" …(+{more})"
 
                     room_title = f"{room_name} ({room_id})" if room_name else str(room_id)
-                    room_item = QTreeWidgetItem([room_title, str(len(seats)), seat_text])
+                    room_item = QTreeWidgetItem([room_title, str(len(seat_nos)), seat_text])
                     if seat_nos:
                         room_item.setToolTip(2, ", ".join(seat_nos))
-                    # 保存房间座位号用于通知构建
-                    seat_nos_map[room_id] = seat_nos
                     lib_item.addChild(room_item)
-
-                lib_item.setText(1, str(lib_free))
-                lib_free_map[lib_name] = lib_free
-                lib_item.setExpanded(False)
 
             tree_widget.resizeColumnToContents(0)
             tree_widget.resizeColumnToContents(1)
 
-            status_label.setText(
-                f"日期：{q.day}  时间：{q.start_time}-{q.end_time}  segment={q.segment}\n"
-                f"馆舍数：{len(grouped)}  房间数：{total_rooms}  总空闲：{total_free}\n"
+            status = (
+                f"日期：{res.q.day}  时间：{res.q.start_time}-{res.q.end_time}  segment={res.q.segment}\n"
+                f"馆舍数：{len(res.grouped)}  房间数：{res.total_rooms}  总空闲：{res.total_free}\n"
                 f"最近刷新：{datetime.now().strftime('%H:%M:%S')}（每 60 秒自动刷新）"
             )
+            if res.dingtalk_status:
+                status += "\n" + res.dingtalk_status
+            status_label.setText(status)
 
-            # --- 钉钉推送逻辑 ---
-            webhook = (
-                webhook_input.text().strip()
-                or os.environ.get("DINGTALK_WEBHOOK")
-                or get_bundled_dingtalk_webhook()
-                or ""
-            )
-            selected_libs = get_selected_libraries(grouped)
-            monitor_key = _monitor_key(selected_libs)
+        def apply_error(msg: str) -> None:
+            show_error("刷新失败", msg)
 
-            # 未选择任何馆舍：不推送
-            has_free = False
-            if selected_libs:
-                has_free = any(lib_free_map.get(lib, 0) > 0 for lib in selected_libs)
+        def finish() -> None:
+            refresh_state["in_flight"] = False
+            reload_btn.setEnabled(True)
+            active_workers.discard(worker)
 
-            # 用户期望“每分钟自动推送”：只要监控集合有空位，每次刷新都推送；无空位则不推送。
-            should_send = bool(webhook) and bool(selected_libs) and has_free
-            last_has_free[monitor_key] = has_free
+        worker.signals.ok.connect(apply_result)
+        worker.signals.error.connect(apply_error)
+        worker.signals.finished.connect(finish)
 
-            if should_send:
-                chunks: list[str] = []
-                for lib in selected_libs:
-                    if lib_free_map.get(lib, 0) <= 0:
-                        continue
-
-                    room_lines: list[str] = []
-                    for room_id, room_name in grouped.get(lib, []):
-                        if not seat_nos_map.get(room_id):
-                            continue
-                        link = (
-                            f"{client.base_url}/h5/index.html#/SeatScreening/{q.segment}"
-                            f"/roomDetail?detail={room_id}&date={q.day}"
-                        )
-                        room_title = room_name or room_id
-                        room_lines.append(f"【{room_title}】{link}")
-
-                    # 理论上有空位时 room_lines 应该非空；这里做兜底。
-                    header = f"{lib}有空位："
-                    if room_lines:
-                        chunks.append(header + "\n" + "\n".join(room_lines))
-                    else:
-                        chunks.append(header)
-
-                text = "\n\n".join(chunks) if chunks else "当前无空位"
-
-                ok = send_dingtalk(webhook, text)
-                if ok:
-                    status_label.setText(status_label.text() + "\n已推送通知到钉钉")
-                else:
-                    status_label.setText(status_label.text() + "\n推送钉钉失败")
-
-        except LibotError as e:
-            show_error("刷新失败", str(e))
-        except Exception as e:  # pragma: no cover
-            show_error("刷新失败", repr(e))
+        QThreadPool.globalInstance().start(worker)
 
     reload_btn.clicked.connect(refresh)
 
