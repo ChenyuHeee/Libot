@@ -6,8 +6,16 @@
 
 ## 你可以做什么
 
+- MacOS
+
 1. 去本仓库的 GitHub Release 下载 `Libot.app`（macOS）
 2. 在你的 Mac 上运行它
+
+- Windows
+
+1. 去本仓库的 GitHub Release 下载 `Libot.exe`（Windows）
+2. 运行 `Libot.exe`
+
 
 然后就会开始自动刷新，并在有空位时推送到群里。
 
