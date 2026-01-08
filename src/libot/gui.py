@@ -50,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
         QCheckBox,
         QDateEdit,
         QFormLayout,
+        QHeaderView,
         QLabel,
         QLineEdit,
         QListWidget,
@@ -197,6 +198,14 @@ def main(argv: list[str] | None = None) -> int:
     tree_widget = QTreeWidget()
     tree_widget.setHeaderLabels(["馆舍/房间", "空闲数", "空闲座位(示例)"])
     tree_widget.setUniformRowHeights(True)
+
+    header = tree_widget.header()
+    header.setStretchLastSection(False)
+    header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+    header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+    tree_widget.setColumnWidth(0, 560)
+    tree_widget.setColumnWidth(2, 420)
 
     splitter.addWidget(panel)
     splitter.addWidget(tree_widget)
@@ -511,11 +520,15 @@ def main(argv: list[str] | None = None) -> int:
         def apply_result(res: RefreshResult) -> None:
             tree_widget.clear()
 
+            first_free_room_item: QTreeWidgetItem | None = None
+
             for lib_name, rooms in res.grouped.items():
                 lib_item = QTreeWidgetItem([lib_name, str(res.lib_free_map.get(lib_name, 0)), ""])
                 lib_item.setFirstColumnSpanned(False)
                 tree_widget.addTopLevelItem(lib_item)
-                lib_item.setExpanded(False)
+
+                lib_has_free = res.lib_free_map.get(lib_name, 0) > 0
+                lib_item.setExpanded(lib_has_free)
 
                 for room_id, room_name in rooms:
                     seat_nos = res.seat_nos_map.get(room_id, [])
@@ -536,8 +549,15 @@ def main(argv: list[str] | None = None) -> int:
                         room_item.setToolTip(2, ", ".join(seat_nos))
                     lib_item.addChild(room_item)
 
-            tree_widget.resizeColumnToContents(0)
+                    if first_free_room_item is None and len(seat_nos) > 0:
+                        first_free_room_item = room_item
+
+            # Try to keep names readable while still adapting other columns.
             tree_widget.resizeColumnToContents(1)
+            tree_widget.setColumnWidth(0, max(tree_widget.columnWidth(0), 560))
+
+            if first_free_room_item is not None:
+                tree_widget.scrollToItem(first_free_room_item)
 
             status = (
                 f"日期：{res.q.day}  时间：{res.q.start_time}-{res.q.end_time}  segment={res.q.segment}\n"
