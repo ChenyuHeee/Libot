@@ -1,0 +1,48 @@
+name: Build Windows release asset
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[gui]"
+          python -m pip install --upgrade pyinstaller
+
+      - name: Build (PyInstaller)
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+
+          # Bundle example config (no secrets) into the app.
+          pyinstaller -y --clean --name Libot --noconsole --add-data "libot_bundled.example.json;." app_gui.py
+
+          $asset = "Libot-$tag-windows-x64.zip"
+          if (Test-Path $asset) { Remove-Item -Force $asset }
+
+          # Package the one-folder build.
+          Compress-Archive -Path "dist/Libot" -DestinationPath $asset
+          "ASSET_NAME=$asset" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET_NAME }}
